@@ -1,830 +1,404 @@
-#include "pilots_fwd.h"
+/*
+ * Звуковая подсистема верхнего уровня: каналы звуков, микширование 8-разрядного PCM,
+ * выбор звукового слоя (WinMM или шлюз Win32s в GMW.DLL) и заглушки после выключения.
+ * Звуковой слой подключается через таблицу указателей звуковых функций (data.c).
+ */
+#include "gm.h"
 
-#pragma pack(push, 2)
+#include <string.h>
 
-/* ---- audio module ---- */
+/* Размер одного буфера вывода WAVE (2048 байт); столько смешивается за раз. */
+#define WAVE_BUFFER_SIZE ((uint32_t)sizeof g_WaveBuffers[0])
 
-int __stdcall PlayMusicTrack(int a1)
+/* Объём буфера обмена с 16-разрядной GMW.DLL. */
+#define GMW_EXCHANGE_SIZE 0xF000u
+
+/* Номер процедуры переходника в GMW.DLL для UTRegister. */
+#define GMW_THUNK_PROC MAKEINTRESOURCEA(2)
+
+/* ------------------------------------------------------------------------ */
+/* Музыка и перезапуск звука                                                 */
+/* ------------------------------------------------------------------------ */
+
+/* Запустить музыку (данные дорожки) и запомнить, что она играет. */
+bool GmMusic_Start(const GM_MUSIC_DATA *music)
 {
-  int result; // eax
-
-  result = StartMusicPlayback(0, -1, a1);
-  byte_411710 = result;
-  return result;
+    /* Признак берётся по младшему байту результата звукового слоя. */
+    g_MusicActive = (uint8_t)GmAudio_PlayMusic(music, -1, 0) != 0;
+    return g_MusicActive;
 }
 
-int __stdcall SwitchMusicTrack(int a1)
+/* Остановить музыку, если играет; номер текущей дорожки = -1. */
+void GmMusic_Stop(void)
 {
-  if ( g_RenderingInProgress )
+    if (g_MusicActive)
+        GmAudio_StopMusic();
+    g_Settings.currentMusic = -1;
+    g_MusicActive = false;
+}
+
+/* Остановить звуки и выключить звук (перед AVI или внешней программой). */
+void GmAudio_StopAndShutdown(void)
+{
+    GmAudio_StopSounds();
+    GmAudio_Shutdown();
+}
+
+/* Заново включить звук (системные громкости запоминаются) и возобновить играющую дорожку. */
+void GmAudio_Restart(void)
+{
+    GmAudio_Init(g_Settings.soundChannels, 0, &g_SystemSoundVolume, &g_SystemMusicVolume);
+    if (g_Settings.currentMusic != -1)
+        Native_PlayMusic(g_Settings.currentMusic);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Заглушки звукового слоя (после GmAudio_Shutdown)                          */
+/* ------------------------------------------------------------------------ */
+
+/* Заглушка закрытия звука: ничего не делает. */
+void GmAudioStub_Shutdown(void)
+{
+}
+
+/* Заглушка звуковых функций без доводов: успех. */
+int GmAudioStub_ReturnTrue(void)
+{
     return 1;
-  ResetGameState();
-  if ( !byte_4162B5 )
+}
+
+/* Заглушка установки громкости: успех. */
+int GmAudioStub_SetVolume(uint8_t volume)
+{
+    (void)volume;
     return 1;
-  g_CurrentMusicIndex = a1;
-  return (char)PlayMusicTrack(*((_DWORD *)&g_MusicTrackArray->trackData + a1));
 }
 
-int __stdcall TriggerSoundSlot(int a1)
+/* Заглушка запуска музыки: успех. */
+int GmAudioStub_PlayMusic(const GM_MUSIC_DATA *music)
 {
-  if ( !g_RenderingInProgress && g_SoundEnabledFlag )
-    PlaySoundEffect(1, 0, -1, (int *)g_SoundSlotArray[a1].soundDataPtr);
-  return 1;
+    (void)music;
+    return 1;
 }
 
-MMRESULT CleanupWaveOut()
+/* ------------------------------------------------------------------------ */
+/* Выбор звукового слоя                                                      */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Открыть звук для Win32s (Windows 3.x): переходник UTRegister в 16-разрядную GMW.DLL,
+ * команда открытия с буферами WAVE, буфер обмена для музыки; указатели слоя — на GmGmw_*.
+ * Возвращает 1 при успехе, 0 при отказе.
+ */
+int GmAudio_OpenGmw(uint8_t *buffers)
 {
-  struct wavehdr_tag *v0; // ebx
+    g_hKernel32ForUT = LoadLibraryA(s_Kernel32Dll);
+    if (g_hKernel32ForUT == NULL)
+        return 0;
 
-  v0 = &pwh;
-  do
-    waveOutUnprepareHeader(g_hWaveOut, v0++, 0x20u);
-  while ( v0 < (struct wavehdr_tag *)&g_hMidiOut );
-  return waveOutClose(g_hWaveOut);
-}
+    /* На Windows 95/NT UTRegister в kernel32 нет — тогда здесь отказ. */
+    g_pfnUTRegister = (PFN_UTREGISTER)(void *)GetProcAddress(g_hKernel32ForUT, s_UTRegister);
+    if (g_pfnUTRegister == NULL)
+        return 0;
+    g_pfnUTUnRegister = (PFN_UTUNREGISTER)(void *)GetProcAddress(g_hKernel32ForUT, s_UTUnRegister);
+    if (g_pfnUTUnRegister == NULL)
+        return 0;
 
-int __stdcall InitWaveOut(DWORD_PTR *a1)
-{
-  DBG_ENTER("InitWaveOut");
-  MMRESULT v1; // edi
-  DWORD *p_dwFlags; // ebx
-  struct wavehdr_tag *v3; // ebp
-  DWORD_PTR *v4; // esi
-  MMRESULT v5; // eax
-  WAVEFORMATEX pwfx; // [esp+10h] [ebp-18h] BYREF
-  DWORD_PTR *v8; // [esp+24h] [ebp-4h]
+    if (!g_pfnUTRegister(g_hAppInstance, s_GmwDll, NULL, GMW_THUNK_PROC, &g_pfnGmwThunk, NULL, NULL))
+        return 0;
 
-  pwfx.wFormatTag = 1;
-  pwfx.nChannels = 1;
-  pwfx.nAvgBytesPerSec = 11025;
-  pwfx.nSamplesPerSec = 11025;
-  pwfx.nBlockAlign = 1;
-  pwfx.wBitsPerSample = 8;
-  pwfx.cbSize = 0;
-  v1 = waveOutOpen(&g_hWaveOut, 0xFFFFFFFF, &pwfx, *a1, 0, 0x10000u);
-  if ( v1 )
-  {
-    sndPlaySoundA(0, 0);
-    v1 = waveOutOpen(&g_hWaveOut, 0xFFFFFFFF, &pwfx, *a1, 0, 0x10000u);
-  }
-  if ( !v1 )
-  {
-    if ( !waveOutGetID(g_hWaveOut, &g_WaveDeviceID) )
+    if (g_pfnGmwThunk(buffers, GMW_OPEN, NULL))
     {
-      p_dwFlags = &pwh.dwFlags;
-      v3 = &pwh;
-      v4 = a1;
-      v8 = a1 + 4096;
-      do
-      {
-        *p_dwFlags = 1;
-        *(p_dwFlags - 4) = (DWORD)v4;
-        *(p_dwFlags - 3) = 2048;
-        v5 = waveOutPrepareHeader(g_hWaveOut, v3, 0x20u);
-        *(_BYTE *)p_dwFlags |= 1u;
-        if ( v5 )
-          break;
-        p_dwFlags += 8;
-        ++v3;
-        v4 += 512;
-      }
-      while ( v8 > v4 );
-      if ( !v5 )
-        return 1;
-    }
-    CleanupWaveOut();
-  }
-  return 0;
-}
-
-unsigned int GetNextWaveBuffer()
-{
-  DWORD *p_dwFlags; // ecx
-
-  p_dwFlags = &pwh.dwFlags;
-  do
-  {
-    if ( (*(_BYTE *)p_dwFlags & 1) != 0 )
-      return (unsigned int)((char *)p_dwFlags - (char *)&pwh.dwFlags) >> 5;
-    p_dwFlags += 8;
-  }
-  while ( p_dwFlags < (DWORD *)&g_MidiTicks );
-  waveOutReset(g_hWaveOut);
-  return 0;
-}
-
-BOOL WriteWaveBuffer()
-{
-  unsigned __int8 v0; // al
-
-  v0 = GetNextWaveBuffer();
-  return waveOutWrite(g_hWaveOut, &pwh + v0, 0x20u) == 0;
-}
-
-BOOL ResetWave()
-{
-  return waveOutReset(g_hWaveOut) == 0;
-}
-
-BOOL PauseWave()
-{
-  return waveOutPause(g_hWaveOut) == 0;
-}
-
-BOOL ResumeWave()
-{
-  return waveOutRestart(g_hWaveOut) == 0;
-}
-
-int __stdcall GetWaveVolume(DWORD a1)
-{
-  int v1; // eax
-  DWORD pdwVolume; // [esp+0h] [ebp-4h] BYREF
-
-  pdwVolume = a1;
-  waveOutGetVolume((HWAVEOUT)g_WaveDeviceID, &pdwVolume);
-  if ( (unsigned __int16)pdwVolume <= HIWORD(pdwVolume) )
-    v1 = HIWORD(pdwVolume);
-  else
-    v1 = (unsigned __int16)pdwVolume;
-  return v1 >> 8;
-}
-
-int __stdcall SetWaveVolume(unsigned __int8 a1)
-{
-  int v1; // ebx
-  int v3; // [esp+4h] [ebp-4h]
-
-  v1 = a1 << 8;
-  LOBYTE(v1) = -1;
-  v3 = waveOutSetVolume((HWAVEOUT)g_WaveDeviceID, v1 | (v1 << 16)) == 0;
-  if ( !a1 )
-    waveOutReset(g_hWaveOut);
-  return v3;
-}
-
-MMRESULT ResetMidi()
-{
-  if ( g_MidiTimerID )
-  {
-    timeKillEvent(g_MidiTimerID);
-    g_MidiTimerID = 0;
-  }
-  return midiOutReset(g_hMidiOut);
-}
-
-int ReadMidiVarLen()
-{
-  int v0; // edx
-
-  v0 = *(unsigned __int8 *)g_MidiDataPtr++;
-  if ( (v0 & 0x80u) != 0 )
-    return (*(unsigned __int8 *)g_MidiDataPtr++ << 7) | v0 & 0x7F;
-  return v0;
-}
-
-MMRESULT ProcessMidiEvents()
-{
-  unsigned __int8 v0; // dl
-  MMRESULT result; // eax
-  DWORD v2; // ebx
-  int v3; // eax
-  char v4; // dl
-  int v5; // ebx
-  char v6; // [esp+4h] [ebp-4h]
-  int v7; // [esp+5h] [ebp-3h]
-
-  while ( 1 )
-  {
-    v6 = 0;
-    v0 = *(_BYTE *)g_MidiDataPtr;
-    if ( *(_BYTE *)g_MidiDataPtr <= 0x7Fu )
-      v0 = byte_411D94;
-    else
-      ++g_MidiDataPtr;
-    byte_411D94 = v0;
-    if ( v0 != 240 && v0 != 247 )
-      break;
-    g_MidiDataPtr += ReadMidiVarLen();
-LABEL_21:
-    if ( !v6 )
-    {
-      v5 = ReadMidiVarLen();
-      if ( v5 )
-      {
-        dword_411D7C += 10 * v5;
-        result = timeGetTime();
-        if ( result < dword_411D7C )
-          return result;
-      }
-    }
-  }
-  if ( v0 != 255 )
-  {
-    v2 = v0 | (*(unsigned __int8 *)g_MidiDataPtr++ << 8);
-    v7 = 1;
-    v3 = v0 & 0xF0;
-    if ( v3 == 128 || v3 == 144 )
-    {
-      v7 = g_MidiVolume != 0;
-    }
-    else if ( v3 == 192 || v3 == 208 )
-    {
-LABEL_19:
-      if ( v7 )
-        midiOutShortMsg(g_hMidiOut, v2);
-      goto LABEL_21;
-    }
-    v4 = *(_BYTE *)g_MidiDataPtr++;
-    v2 = (unsigned __int16)v2 | ((v4 & 0x7F) << 16);
-    v6 = v4 & 0x80;
-    goto LABEL_19;
-  }
-  if ( g_MidiPlaying == 0xFFFF )
-    return ResetMidi();
-  g_MidiLooping = g_MidiPlaying;
-  g_MidiDataPtr = g_MidiDataStart;
-  return g_MidiDataStart;
-}
-
-void __stdcall MidiTimerCallback(UINT uTimerID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dw1, DWORD_PTR dw2)
-{
-  if ( g_MidiLooping )
-  {
-    if ( --g_MidiLooping )
-      return;
-    dword_411D7C = timeGetTime();
-  }
-  if ( timeGetTime() >= __PAIR64__(g_MidiTicks, dword_411D7C) )
-  {
-    ++g_MidiTicks;
-    ProcessMidiEvents();
-    --g_MidiTicks;
-  }
-}
-
-MMRESULT CleanupMidiOut()
-{
-  MMRESULT result; // eax
-
-  result = ResetMidi();
-  if ( g_TimerResolution )
-  {
-    result = timeEndPeriod(g_TimerResolution);
-    g_TimerResolution = 0;
-  }
-  if ( g_hMidiOut )
-  {
-    result = midiOutClose(g_hMidiOut);
-    g_hMidiOut = 0;
-  }
-  return result;
-}
-
-int InitMidiOut()
-{
-  DBG_ENTER("InitMidiOut");
-  UINT wPeriodMin; // eax
-  UINT wPeriodMax; // eax
-  struct timecaps_tag ptc; // [esp+0h] [ebp-8h] BYREF
-
-  if ( !midiOutOpen(&g_hMidiOut, 0xFFFFFFFF, 0, 0, 0) )
-  {
-    g_TimerResolution = 0;
-    g_MidiVolume = 1;
-    if ( !midiOutGetID(g_hMidiOut, &g_MidiDeviceID) && !timeGetDevCaps(&ptc, 8u) )
-    {
-      wPeriodMin = ptc.wPeriodMin;
-      if ( ptc.wPeriodMin <= 0xA )
-        wPeriodMin = 10;
-      if ( wPeriodMin >= ptc.wPeriodMax )
-        wPeriodMax = ptc.wPeriodMax;
-      else
-        wPeriodMax = ptc.wPeriodMin <= 0xA ? 10 : ptc.wPeriodMin;
-      g_TimerResolution = wPeriodMax;
-      if ( !timeBeginPeriod(wPeriodMax) )
-        return 1;
-    }
-    CleanupMidiOut();
-  }
-  return 0;
-}
-
-int __stdcall StartMidiPlayback(int a1)
-{
-  int result; // eax
-
-  ResetMidi();
-  g_MidiDataPtr = a1 + 4;
-  if ( *(_BYTE *)(a1 + 4) == 0xF8 )
-  {
-    ++g_MidiDataPtr;
-    ReadMidiVarLen();
-    ++g_MidiDataPtr;
-  }
-  g_MidiDataStart = g_MidiDataPtr;
-  g_MidiPlaying = 1;
-  g_MidiLooping = 1;
-  g_MidiTicks = 0;
-  g_MidiTimerID = timeSetEvent(0xAu, g_TimerResolution, MidiTimerCallback, 0, 1u);
-  result = 1;
-  if ( !g_MidiTimerID )
-  {
-    ResetMidi();
-    return 0;
-  }
-  return result;
-}
-
-char StopMidiPlayback()
-{
-  ResetMidi();
-  return 1;
-}
-
-int __stdcall GetMidiVolume(DWORD a1)
-{
-  int v1; // eax
-  DWORD pdwVolume; // [esp+0h] [ebp-4h] BYREF
-
-  pdwVolume = a1;
-  midiOutGetVolume((HMIDIOUT)g_MidiDeviceID, &pdwVolume);
-  if ( (unsigned __int16)pdwVolume <= HIWORD(pdwVolume) )
-    v1 = HIWORD(pdwVolume);
-  else
-    v1 = (unsigned __int16)pdwVolume;
-  return v1 >> 8;
-}
-
-int __stdcall SetMidiVolume(unsigned __int8 a1)
-{
-  int v1; // ebx
-  int v3; // [esp+4h] [ebp-4h]
-
-  g_MidiVolume = a1;
-  v1 = a1 << 8;
-  LOBYTE(v1) = -1;
-  v3 = midiOutSetVolume((HMIDIOUT)g_MidiDeviceID, v1 | (v1 << 16)) == 0;
-  if ( !a1 )
-    midiOutReset(g_hMidiOut);
-  return v3;
-}
-
-char __cdecl MultimediaStub_NoArgs()
-{
-  return 1;
-}
-
-char __stdcall MultimediaStub_OneArg(int param)
-{
-  return 1;
-}
-
-char __stdcall MultimediaStub_StartMidi(int param)
-{
-  return 1;
-}
-
-HGLOBAL WinNT_CleanupMultimedia()
-{
-  HGLOBAL result; // eax
-
-  if ( g_pGraphicsFunc )
-    result = (HGLOBAL)g_pGraphicsFunc(0, 513, 0);
-  if ( g_pUnregisterFunc )
-    result = (HGLOBAL)g_pUnregisterFunc(g_hAppInstance);
-  if ( g_hGraphicsDLL )
-    result = (HGLOBAL)FreeLibrary(g_hGraphicsDLL);
-  if ( g_hGraphicsMemory )
-  {
-    result = GlobalFree(g_hGraphicsMemory);
-    g_hGraphicsMemory = 0;
-  }
-  return result;
-}
-
-int WinNT_WriteWaveBuffer()
-{
-  return g_pGraphicsFunc(0, 514, 0);
-}
-
-int WinNT_ResetWave()
-{
-  return g_pGraphicsFunc(0, 515, 0);
-}
-
-int WinNT_GetNextWaveBuffer()
-{
-  return g_pGraphicsFunc(0, 517, 0);
-}
-
-int WinNT_PauseWave()
-{
-  return g_pGraphicsFunc(0, 518, 0);
-}
-
-int WinNT_ResumeWave()
-{
-  return g_pGraphicsFunc(0, 519, 0);
-}
-
-int __stdcall WinNT_SetWaveVolume(unsigned __int8 a1)
-{
-  return g_pGraphicsFunc(0, a1, 0);
-}
-
-int __stdcall WinNT_StartMidiPlayback(_DWORD *Src)
-{
-  int result; // eax
-
-  if ( g_hGraphicsMemory )
-  {
-    memcpy(g_hGraphicsMemory, Src, *Src + 4);
-    return g_pGraphicsFunc(g_hGraphicsMemory, 520, 0);
-  }
-  return result;
-}
-
-int WinNT_StopMidiPlayback()
-{
-  return g_pGraphicsFunc(0, 521, 0);
-}
-
-int __stdcall WinNT_SetMidiVolume(unsigned __int8 a1)
-{
-  return g_pGraphicsFunc(0, a1 + 256, 0);
-}
-
-char __stdcall InitGraphics_WinNT(int a1)
-{
-  DBG_ENTER("InitGraphics_WinNT");
-  HMODULE LibraryA; // eax
-
-  LibraryA = LoadLibraryA("GMW.DLL");
-  g_hGraphicsDLL = LibraryA;
-  if ( LibraryA )
-  {
-    g_pRegisterFunc = (int (__stdcall *)(_DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD, _DWORD))GetProcAddress(
-                                                                                                   LibraryA, "UTRegister");
-    if ( g_pRegisterFunc )
-    {
-      g_pUnregisterFunc = (int (__stdcall *)(_DWORD))GetProcAddress(g_hGraphicsDLL, "UTUnRegister");
-      if ( g_pUnregisterFunc )
-      {
-        if ( g_pRegisterFunc(g_hAppInstance, "GMW.DLL", 0, 2, &g_pGraphicsFunc, 0, 0) )
+        g_GmwBuffer = GlobalAlloc(GMEM_FIXED, GMW_EXCHANGE_SIZE);
+        if (g_GmwBuffer != NULL)
         {
-          if ( g_pGraphicsFunc(a1, 512, 0) )
-          {
-            g_hGraphicsMemory = GlobalAlloc(0, 0xF000u);
-            if ( g_hGraphicsMemory )
-            {
-              g_pfnWriteWaveBuffer = WinNT_WriteWaveBuffer;
-              g_pfnResetWave = WinNT_ResetWave;
-              g_pfnGetWaveVolume = GetCurrentScreenMode;
-              g_pfnSetWaveVolume = (int (*)(int))WinNT_SetWaveVolume;
-              g_pfnGetNextWaveBuffer = WinNT_GetNextWaveBuffer;
-              g_pfnPauseWave = WinNT_PauseWave;
-              g_pfnResumeWave = WinNT_ResumeWave;
-              g_pfnStartMidiPlayback = (int (*)(int))WinNT_StartMidiPlayback;
-              g_pfnStopMidiPlayback = WinNT_StopMidiPlayback;
-              g_pfnGetMidiVolume = GetMaxScreenMode;
-              g_pfnSetMidiVolume = (int (*)(int))WinNT_SetMidiVolume;
-              g_pfnCleanupMultimedia = (int (*)())WinNT_CleanupMultimedia;
-              return 1;
-            }
-          }
-          WinNT_CleanupMultimedia();
+            g_pfnAudioSubmit = GmGmw_Submit;
+            g_pfnAudioReset = GmGmw_Reset;
+            g_pfnGetSoundVolume = GmGmw_GetSoundVolume;
+            g_pfnSetSoundVolume = GmGmw_SetSoundVolume;
+            g_pfnAudioNextBuffer = GmGmw_NextBuffer;
+            g_pfnAudioPause = GmGmw_Pause;
+            g_pfnAudioResume = GmGmw_Resume;
+            g_pfnMusicPlay = GmGmw_PlayMusic;
+            g_pfnMusicStop = GmGmw_StopMusic;
+            g_pfnGetMusicVolume = GmGmw_GetMusicVolume;
+            g_pfnSetMusicVolume = GmGmw_SetMusicVolume;
+            g_pfnAudioShutdown = GmGmw_Close;
+            return 1;
         }
-      }
     }
-  }
-  return 0;
-}
-
-int CleanupMultimedia()
-{
-  DBG_ENTER("CleanupMultimedia");
-  CleanupWaveOut();
-  return CleanupMidiOut();
-}
-
-char __stdcall InitDirectDraw_Win95(DWORD_PTR *pHwnd)
-{
-  DBG_ENTER("InitDirectDraw_Win95");
-  int audioInitResult; // [esp-4h] [ebp-4h]
-
-  audioInitResult = (unsigned __int8)InitWaveOut(pHwnd);
-  if ( (unsigned __int8)InitMidiOut() | audioInitResult )
-  {
-    g_pfnWriteWaveBuffer = WriteWaveBuffer;
-    g_pfnResetWave = ResetWave;
-    g_pfnGetWaveVolume = (_DWORD (*)())GetWaveVolume;
-    g_pfnSetWaveVolume = (int (*)(int))SetWaveVolume;
-    g_pfnGetNextWaveBuffer = (int (*)())GetNextWaveBuffer;
-    g_pfnPauseWave = PauseWave;
-    g_pfnResumeWave = ResumeWave;
-    g_pfnStartMidiPlayback = (int (*)())StartMidiPlayback;
-    g_pfnStopMidiPlayback = (int (*)())StopMidiPlayback;
-    g_pfnGetMidiVolume = (_DWORD (*)())GetMidiVolume;
-    g_pfnSetMidiVolume = (int (*)(int))SetMidiVolume;
-    g_pfnCleanupMultimedia = CleanupMultimedia;
-    return 1;
-  }
-  else
-  {
-    CleanupMultimedia();
+    GmGmw_Close();
     return 0;
-  }
 }
 
-void __stdcall CopyAudioBufferAndPadSilence(unsigned int byteSize, const void *srcBuffer, void *dstBuffer)
+/* Закрыть WAVE и MIDI. */
+void GmAudio_CloseWinMM(void)
 {
-  qmemcpy(dstBuffer, srcBuffer, 4 * (byteSize >> 2));// Copy srcBuffer -> dstBuffer (DWORD-aligned fast copy)
-  if ( byteSize >> 2 != 512 )                   // 0x80808080 = silence pattern for unsigned 8-bit PCM (128 per sample)
-    memset((char *)dstBuffer + 4 * (byteSize >> 2), 0x80u, 4 * (512 - (byteSize >> 2)));// Pad remaining buffer with silence
+    GmWave_Close();
+    GmMidi_Close();
 }
 
-int __stdcall BlendPixelBuffersSaturated(unsigned int a1, int *a2, int *a3)
+/*
+ * Открыть звук WinMM (Windows 95/NT): WAVE и MIDI, достаточно одного из них;
+ * указатели слоя — на функции GmWave_ и GmMidi_. Возвращает 1 при успехе, 0 при отказе.
+ */
+int GmAudio_OpenWinMM(uint8_t *buffers)
 {
-  unsigned int v5; // ecx
-  int v6; // edx
-  int v7; // sf
-  int v8; // of
-  int v9; // eax
-  int v10; // sf
-  char v11; // ah
-  __int16 v12; // dx
-  char v13; // dh
-  int v14; // sf
-  int v15; // eax
-  int v16; // sf
-  char v17; // ah
-  int result; // eax
+    bool waveOpened = GmWave_Open(buffers);
 
-  v5 = a1 >> 2;
-  do
-  {
-    v9 = *a2++;
-    v6 = *a3;
-    LOBYTE(v9) = v9 + 0x80;
-    LOBYTE(v6) = *a3 + 0x80;
-    BYTE1(v9) += 0x80;
-    BYTE1(v6) = BYTE1(*a3) + 0x80;
-    v8 = __OFADD__((_BYTE)v6, (_BYTE)v9);
-    v7 = (char)(v6 + v9) < 0;
-    LOBYTE(v9) = v6 + v9;
-    if ( v8 )
+    if (!GmMidi_Open() && !waveOpened)
     {
-      if ( v7 )
-        LOBYTE(v9) = -16;
-      else
-        LOBYTE(v9) = 0;
+        GmAudio_CloseWinMM();
+        return 0;
     }
-    else
-    {
-      LOBYTE(v9) = v9 + 0x80;
-    }
-    v8 = __OFADD__(BYTE1(v6), BYTE1(v9));
-    v10 = (char)(BYTE1(v6) + BYTE1(v9)) < 0;
-    v11 = BYTE1(v6) + BYTE1(v9);
-    if ( v8 )
-    {
-      if ( v10 )
-        BYTE1(v9) = -16;
-      else
-        BYTE1(v9) = 0;
-    }
-    else
-    {
-      BYTE1(v9) = v11 + 0x80;
-    }
-    v15 = __ROL4__(v9, 16);
-    v12 = __ROL4__(v6, 16);
-    LOBYTE(v15) = v15 + 0x80;
-    LOBYTE(v12) = v12 + 0x80;
-    BYTE1(v15) += 0x80;
-    v13 = HIBYTE(v12) + 0x80;
-    v8 = __OFADD__((_BYTE)v12, (_BYTE)v15);
-    v14 = (char)(v12 + v15) < 0;
-    LOBYTE(v15) = v12 + v15;
-    if ( v8 )
-    {
-      if ( v14 )
-        LOBYTE(v15) = -16;
-      else
-        LOBYTE(v15) = 0;
-    }
-    else
-    {
-      LOBYTE(v15) = v15 + 0x80;
-    }
-    v8 = __OFADD__(v13, BYTE1(v15));
-    v16 = (char)(v13 + BYTE1(v15)) < 0;
-    v17 = v13 + BYTE1(v15);
-    if ( v8 )
-    {
-      if ( v16 )
-        BYTE1(v15) = -16;
-      else
-        BYTE1(v15) = 0;
-    }
-    else
-    {
-      BYTE1(v15) = v17 + 0x80;
-    }
-    result = __ROL4__(v15, 16);
-    --v5;
-    *a3++ = result;
-  }
-  while ( v5 );
-  return result;
+
+    g_pfnAudioSubmit = GmWave_Submit;
+    g_pfnAudioReset = GmWave_Reset;
+    g_pfnGetSoundVolume = GmWave_GetVolume;
+    g_pfnSetSoundVolume = GmWave_SetVolume;
+    g_pfnAudioNextBuffer = GmWave_FindFreeBuffer;
+    g_pfnAudioPause = GmWave_Pause;
+    g_pfnAudioResume = GmWave_Resume;
+    g_pfnMusicPlay = GmMidi_Play;
+    g_pfnMusicStop = GmMidi_Stop;
+    g_pfnGetMusicVolume = GmMidi_GetVolume;
+    g_pfnSetMusicVolume = GmMidi_SetVolume;
+    g_pfnAudioShutdown = GmAudio_CloseWinMM;
+    return 1;
 }
 
-char __stdcall InitGraphics(_BYTE *pMaxScreen, _BYTE *pCurrentScreen, int unused, unsigned __int8 graphicsConfig)
-{
-  DBG_ENTER("InitGraphics");
-  signed int windowsVersion; // ebx
-  char initResult; // al
-  int *bufferPtr; // ebx
+/* ------------------------------------------------------------------------ */
+/* Микширование                                                              */
+/* ------------------------------------------------------------------------ */
 
-  windowsVersion = GetVersion();
-  g_hMainWindow[0] = (DWORD_PTR)g_MainWindow;
-  if ( windowsVersion >= 0 || (unsigned __int8)windowsVersion >= 4u )
-    initResult = InitDirectDraw_Win95(g_hMainWindow);
-  else
-    initResult = InitGraphics_WinNT((int)g_hMainWindow);
-  if ( initResult )
-  {
-    *pCurrentScreen = g_pfnGetWaveVolume();
-    *pMaxScreen = g_pfnGetMidiVolume();
-    g_GraphicsConfig = graphicsConfig;
-    g_GraphicsState1 = 0;
-    g_GraphicsState2 = 0;
-    bufferPtr = g_GraphicsBuffers;
+/*
+ * Подмешать канал к буферу вывода: беззнаковые 8-разрядные отсчёты складываются
+ * как знаковые (относительно 0x80) с насыщением. size — число байт, обрабатывается
+ * кратно 4 (в оригинале — ассемблер, по двойному слову за шаг).
+ */
+void GmMix_AddSaturated(uint32_t *dst, const uint32_t *src, uint32_t size)
+{
+    uint8_t *out = (uint8_t *)dst;
+    const uint8_t *in = (const uint8_t *)src;
+    uint32_t dwordsLeft = size >> 2;
+
+    /* Особенность оригинала: проверка счётчика в конце цикла, при size < 4 он
+       не останавливается (на практике размер всегда не меньше 4). */
     do
     {
-      *bufferPtr = 0;
-      bufferPtr += 4;
-    }
-    while ( &g_GraphicsBuffers[4 * g_GraphicsConfig] > bufferPtr );
-  }
-  return 1;
+        for (int i = 0; i < 4; i++)
+        {
+            int sum = in[i] + out[i] - 0x80;
+
+            /* Особенность оригинала: переполнение вверх зажимается в 0xF0, а не в 0xFF. */
+            if (sum > 0xFF)
+                out[i] = GMPCM_CLIP_HIGH;
+            else if (sum < 0)
+                out[i] = GMPCM_CLIP_LOW;
+            else
+                out[i] = (uint8_t)sum;
+        }
+        in += 4;
+        out += 4;
+    } while (--dwordsLeft != 0);
 }
 
-int __stdcall StartMusicPlayback(int a1, int a2, int param)
+/*
+ * Смешать очередные 2048 байт всех активных каналов в свободный буфер вывода
+ * (первый канал копируется, прочие подмешиваются с насыщением) и отдать буфер
+ * устройству. Зовётся по MM_WOM_DONE и при запуске звука. Если смешивать нечего,
+ * возвращает номер свободного буфера, иначе — результат отдачи.
+ */
+int GmAudio_Mix(void)
 {
-  return ((int (__stdcall *)(int))g_pfnStartMidiPlayback)(param);
-}
+    int mixed = 0;
+    int bufferIndex = (uint8_t)g_pfnAudioNextBuffer();
+    uint8_t *outBuffer = g_WaveBuffers[bufferIndex];
+    GM_SOUND_CHANNEL *channel = g_SoundChannels;
 
-char __stdcall PlaySoundEffect(char a1, char a2, char a3, int *a4)
-{
-  int v4; // ebx
-  int v5; // ecx
-  int v6; // edx
-  int v7; // ebx
-
-  v4 = g_GraphicsState2;
-  do
-  {
-    if ( !g_GraphicsBuffers[4 * v4] )
-      break;
-    if ( ++v4 >= (unsigned int)g_GraphicsConfig )
-      v4 = 0;
-  }
-  while ( v4 != g_GraphicsState2 );
-  g_GraphicsState2 = v4;
-  v5 = *a4;
-  LOBYTE(v5) = *a4 & 0xFC;
-  v6 = 4 * v4;
-  dword_411DB8[v6] = v5;
-  g_GraphicsBuffers[v6] = (int)(a4 + 1);
-  dword_411DB4[v6] = (int)(a4 + 1);
-  byte_411DBD[v6 * 4] = a2;
-  byte_411DBC[v6 * 4] = a3;
-  byte_411DBE[v6 * 4] = a1;
-  if ( a1 >= 0 )
-  {
-    if ( g_GraphicsState1 )
-      v7 = 0;
-    else
-      v7 = 2;
-  }
-  else
-  {
-    v7 = 1;
-  }
-  if ( v7 == 2 )
-  {
-    MixAudioBuffers();
-  }
-  else if ( v7 != 1 )
-  {
-    return 1;
-  }
-  MixAudioBuffers();
-  return 1;
-}
-
-int __stdcall SetMusicVolume(int a1)
-{
-  return ((int (__stdcall *)(int))g_pfnSetMidiVolume)(a1);
-}
-
-int __stdcall SetSoundVolume(int volume)
-{
-  int result; // eax
-
-  LOBYTE(result) = ((int (__stdcall *)(int))g_pfnSetWaveVolume)(volume);
-  return result;
-}
-
-char __cdecl StopMidiMusic()
-{
-  return g_pfnStopMidiPlayback();
-}
-
-char ClearInputBuffer()
-{
-  int *v0; // ecx
-
-  v0 = g_GraphicsBuffers;
-  do
-  {
-    *v0 = 0;
-    v0 += 4;
-  }
-  while ( &g_GraphicsBuffers[4 * g_GraphicsConfig] > v0 );
-  return g_pfnResetWave();
-}
-
-unsigned __int8 MixAudioBuffers()
-{
-  int v0; // edi
-  unsigned __int8 result; // al
-  int *v2; // ebp
-  int *v3; // ebx
-  unsigned int v4; // esi
-  int v5; // zf
-  int *v6; // [esp-8h] [ebp-18h]
-
-  v0 = 0;
-  result = g_pfnGetNextWaveBuffer();
-  v2 = (int *)&g_hMainWindow[512 * result];
-  v3 = g_GraphicsBuffers;
-  do
-  {
-    if ( *v3 )
+    /* Как в оригинале, первый канал просматривается и при нулевом числе каналов. */
+    do
     {
-      v4 = v3[2];
-      if ( v4 > 0x800 )
-        v4 = 2048;
-      v6 = (int *)v3[1];
-      if ( v0 )
-        result = BlendPixelBuffersSaturated(v4, v6, v2);
-      else
-        CopyAudioBufferAndPadSilence(v4, v6, (char *)v2);
-      v5 = v3[2] == v4;
-      v3[2] -= v4;
-      if ( v5 )
-        *v3 = 0;
-      else
-        v3[1] += v4;
-      ++v0;
+        if (channel->start != NULL)
+        {
+            uint32_t chunk = channel->remaining;
+            if (chunk > WAVE_BUFFER_SIZE)
+                chunk = WAVE_BUFFER_SIZE;
+
+            if (mixed)
+            {
+                GmMix_AddSaturated((uint32_t *)outBuffer, (const uint32_t *)channel->cur, chunk);
+            }
+            else
+            {
+                /* Первый канал: копия, остаток буфера — тишина. */
+                uint32_t copied = chunk & ~3u;
+                memcpy(outBuffer, channel->cur, copied);
+                memset(outBuffer + copied, 0x80, WAVE_BUFFER_SIZE - copied);
+            }
+
+            channel->remaining -= chunk;
+            if (channel->remaining == 0)
+                channel->start = NULL;
+            else
+                channel->cur += chunk;
+            ++mixed;
+        }
+        ++channel;
+    } while (channel < &g_SoundChannels[g_SoundChannelCount]);
+
+    g_ChannelsInLastMix = mixed;
+    if (mixed)
+        return g_pfnAudioSubmit();
+    return bufferIndex;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Внешний интерфейс звука                                                   */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Включить звук: на Windows 95/NT — WinMM, на Win32s — шлюз GMW. Выдаёт системные
+ * громкости звука и музыки и заводит channelCount пустых каналов. Всегда true.
+ */
+bool GmAudio_Init(uint8_t channelCount, int unused, uint8_t *soundVolume, uint8_t *musicVolume)
+{
+    DWORD version = GetVersion();
+    int opened;
+
+    (void)unused;
+
+    /* Первое двойное слово буферов WAVE временно хранит окно для уведомлений. */
+    memcpy(g_WaveBuffers[0], &g_MainWindow, sizeof g_MainWindow);
+
+    /* Старший разряд сброшен — NT; иначе Windows 95 (версия 4+) или Win32s. */
+    if ((version & 0x80000000u) == 0 || (uint8_t)version >= 4)
+        opened = GmAudio_OpenWinMM(g_WaveBuffers[0]);
+    else
+        opened = GmAudio_OpenGmw(g_WaveBuffers[0]);
+
+    if (opened)
+    {
+        *soundVolume = (uint8_t)g_pfnGetSoundVolume();
+        *musicVolume = (uint8_t)g_pfnGetMusicVolume();
+        g_SoundChannelCount = channelCount;
+        g_ChannelsInLastMix = 0;
+        g_NextSoundChannel = 0;
+
+        GM_SOUND_CHANNEL *channel = g_SoundChannels;
+        do
+        {
+            channel->start = NULL;
+            ++channel;
+        } while (channel < &g_SoundChannels[g_SoundChannelCount]);
     }
-    v3 += 4;
-  }
-  while ( &g_GraphicsBuffers[4 * g_GraphicsConfig] > v3 );
-  g_GraphicsState1 = v0;
-  if ( v0 )
-    return g_pfnWriteWaveBuffer();
-  return result;
+    return true;
 }
 
-char __cdecl PauseWavePlayback()
+/* Запустить музыку через текущий звуковой слой; два последних довода не используются. */
+int GmAudio_PlayMusic(const GM_MUSIC_DATA *music, int unusedMinusOne, int unusedZero)
 {
-  return g_pfnPauseWave();
+    (void)unusedMinusOne;
+    (void)unusedZero;
+    return g_pfnMusicPlay(music);
 }
 
-char __cdecl ResumeWavePlayback()
+/*
+ * Сыграть звук: занять свободный канал (по кругу от последнего выбранного; если все
+ * заняты — вытеснить его). mode < 0 — сразу подмешать один буфер; mode >= 0 — если
+ * вывод простаивал, сразу подмешать два (двойная буферизация), иначе звук подхватит
+ * следующий MM_WOM_DONE. unreadFF и unreadZero сохраняются в канале, но не читаются.
+ */
+bool GmAudio_PlaySound(const GM_SOUND_DATA *sound, uint8_t unreadFF, uint8_t unreadZero, int8_t mode)
 {
-  return g_pfnResumeWave();
+    uint32_t index = g_NextSoundChannel;
+
+    do
+    {
+        if (g_SoundChannels[index].start == NULL)
+            break;
+        if (++index >= g_SoundChannelCount)
+            index = 0;
+    } while (index != g_NextSoundChannel);
+    g_NextSoundChannel = index;
+
+    GM_SOUND_CHANNEL *channel = &g_SoundChannels[index];
+    channel->remaining = sound->length & ~3u;
+    channel->start = (uint8_t *)sound->pcm;
+    channel->cur = (uint8_t *)sound->pcm;
+    channel->unreadZero = unreadZero;
+    channel->unreadFF = unreadFF;
+    channel->mode = mode;
+
+    if (mode < 0)
+    {
+        GmAudio_Mix();
+    }
+    else if (g_ChannelsInLastMix == 0)
+    {
+        GmAudio_Mix();
+        GmAudio_Mix();
+    }
+    return true;
 }
 
-void __cdecl ShutdownMultimedia()
+/* Задать громкость музыки через текущий звуковой слой. */
+int GmAudio_SetMusicVolume(uint8_t volume)
 {
-  DBG_ENTER("ShutdownMultimedia");
-  g_pfnCleanupMultimedia();
-  g_pfnStartMidiPlayback = (int (*)(int))MultimediaStub_StartMidi;// Reset all multimedia function pointers to no-op stubs
-  g_pfnResumeWave = MultimediaStub_NoArgs;
-  g_pfnPauseWave = (int (*)())MultimediaStub_NoArgs;
-  g_pfnGetNextWaveBuffer = (_DWORD (*)())MultimediaStub_NoArgs;
-  g_pfnGetMidiVolume = (_DWORD (*)())MultimediaStub_NoArgs;
-  g_pfnGetWaveVolume = (_DWORD (*)())MultimediaStub_NoArgs;
-  g_pfnStopMidiPlayback = (int (*)())MultimediaStub_NoArgs;
-  g_pfnResetWave = (_DWORD (*)())MultimediaStub_NoArgs;
-  g_pfnWriteWaveBuffer = (_DWORD (*)())MultimediaStub_NoArgs;
-  g_pfnSetMidiVolume = (int (*)(int))MultimediaStub_OneArg;
-  g_pfnSetWaveVolume = (int (*)(int))MultimediaStub_OneArg;
-  g_pfnCleanupMultimedia = nullsub_6;           // Set cleanup handler itself to nullsub (idempotent)
+    return g_pfnSetMusicVolume(volume);
 }
 
-#pragma pack(pop)
+/* Задать громкость звука через текущий звуковой слой. */
+int GmAudio_SetSoundVolume(uint8_t volume)
+{
+    return g_pfnSetSoundVolume(volume);
+}
+
+/* Остановить музыку через текущий звуковой слой. */
+int GmAudio_StopMusic(void)
+{
+    return g_pfnMusicStop();
+}
+
+/* Остановить все звуки: освободить каналы и сбросить вывод. */
+int GmAudio_StopSounds(void)
+{
+    GM_SOUND_CHANNEL *channel = g_SoundChannels;
+
+    do
+    {
+        channel->start = NULL;
+        ++channel;
+    } while (channel < &g_SoundChannels[g_SoundChannelCount]);
+    return g_pfnAudioReset();
+}
+
+/* Приостановить вывод звука. */
+int GmAudio_Pause(void)
+{
+    return g_pfnAudioPause();
+}
+
+/* Возобновить вывод звука. */
+int GmAudio_Resume(void)
+{
+    return g_pfnAudioResume();
+}
+
+/* Выключить звук: закрыть текущий слой и поставить во все указатели заглушки. */
+void GmAudio_Shutdown(void)
+{
+    g_pfnAudioShutdown();
+    g_pfnMusicPlay = GmAudioStub_PlayMusic;
+    g_pfnAudioResume = GmAudioStub_ReturnTrue;
+    g_pfnAudioPause = GmAudioStub_ReturnTrue;
+    g_pfnAudioNextBuffer = GmAudioStub_ReturnTrue;
+    g_pfnGetMusicVolume = GmAudioStub_ReturnTrue;
+    g_pfnGetSoundVolume = GmAudioStub_ReturnTrue;
+    g_pfnMusicStop = GmAudioStub_ReturnTrue;
+    g_pfnAudioReset = GmAudioStub_ReturnTrue;
+    g_pfnAudioSubmit = GmAudioStub_ReturnTrue;
+    g_pfnSetMusicVolume = GmAudioStub_SetVolume;
+    g_pfnSetSoundVolume = GmAudioStub_SetVolume;
+    g_pfnAudioShutdown = GmAudioStub_Shutdown;
+}

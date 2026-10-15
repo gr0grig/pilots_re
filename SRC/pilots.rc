@@ -1,0 +1,2 @@
+/* Ресурсы программы: значок окна (номер HOST_ICON_RESOURCE в host.c). */
+100 ICON "pilots.ico"
